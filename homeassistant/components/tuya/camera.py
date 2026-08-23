@@ -1,130 +1,102 @@
-"""Support for Tuya cameras."""
+"""Home Assistant entity to display the map from a vacuum."""
 
-from typing import override
+import io
+import logging
+from datetime import timedelta
+from typing import Any, Coroutine
 
-from tuya_device_handlers.definition.camera import (
-    CameraDefinition,
-    get_default_definition,
-)
-from tuya_sharing import CustomerDevice, Manager
+import tuya_vacuum
+from homeassistant.components.camera import Camera, ENTITY_ID_FORMAT
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity import generate_entity_id
 
-from homeassistant.components import ffmpeg
-from homeassistant.components.camera import (
-    Camera as CameraEntity,
-    CameraEntityDescription,
-    CameraEntityFeature,
-)
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+SCAN_INTERVAL = timedelta(seconds=10)
 
-from .const import TUYA_DISCOVERY_NEW, DeviceCategory
-from .coordinator import TuyaConfigEntry
-from .entity import TuyaEntity
-
-CAMERAS: dict[DeviceCategory, CameraEntityDescription] = {
-    DeviceCategory.DGHSXJ: CameraEntityDescription(key=""),
-    DeviceCategory.SP: CameraEntityDescription(key=""),
-}
+_LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: TuyaConfigEntry,
-    async_add_entities: AddConfigEntryEntitiesCallback,
+    config_entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up Tuya cameras dynamically through Tuya discovery."""
-    manager = entry.runtime_data.manager
+    """Add camera for passed config_entry in HA."""
 
-    @callback
-    def async_discover_device(device_ids: list[str]) -> None:
-        """Discover and add a discovered Tuya camera."""
-        entities: list[TuyaCameraEntity] = []
-        for device_id in device_ids:
-            device = manager.device_map[device_id]
-            if description := CAMERAS.get(device.category):
-                entities.append(
-                    TuyaCameraEntity(
-                        device, manager, description, get_default_definition(device)
-                    )
-                )
+    _LOGGER.debug("Async setup entry")
+    name = config_entry.title
+    entity_id = generate_entity_id(ENTITY_ID_FORMAT, name, hass=hass)
+    origin = config_entry.data["server"]
+    client_id = config_entry.data["client_id"]
+    client_secret = config_entry.data["client_secret"]
+    device_id = config_entry.data["device_id"]
 
-        async_add_entities(entities)
+    _LOGGER.debug("Adding entities")
 
-    async_discover_device([*manager.device_map])
-
-    entry.async_on_unload(
-        async_dispatcher_connect(hass, TUYA_DISCOVERY_NEW, async_discover_device)
+    # Add entity to HA.
+    async_add_entities(
+        [VacuumMapCamera(origin, client_id, client_secret, device_id, entity_id, hass)]
     )
 
+    _LOGGER.debug("Done")
 
-class TuyaCameraEntity(TuyaEntity, CameraEntity):
-    """Tuya Camera Entity."""
 
-    _attr_supported_features = CameraEntityFeature.STREAM
-    _attr_brand = "Tuya"
-    _attr_name = None
+class VacuumMapCamera(Camera):
+    """Home Assistant entity to display the map from a vacuum."""
 
-    def __init__(
-        self,
-        device: CustomerDevice,
-        device_manager: Manager,
-        description: CameraEntityDescription,
-        definition: CameraDefinition,
-    ) -> None:
-        """Init Tuya Camera."""
-        super().__init__(device, device_manager, description)
-        CameraEntity.__init__(self)
-        self._attr_model = device.product_name
-        self._motion_detection_switch = definition.motion_detection_switch
-        self._recording_status = definition.recording_status
+    def __init__(self, origin, client_id, client_secret, device_id, entity_id, hass):
+        """Initialize the camera."""
+        super().__init__()
+        self._origin = origin
+        self._client_id = client_id
+        self._client_secret = client_secret
+        self._device_id = device_id
+        self._image = None
+        self.hass = hass
 
-    @property
-    @override
-    def is_recording(self) -> bool:
-        """Return true if the device is recording."""
-        if (status := self._read_wrapper(self._recording_status)) is not None:
-            return status
-        return False
+        # Try to get this to work
+        self.content_type = "image/png"
+        self.entity_id = entity_id
+        self._attr_is_streaming = True
 
-    @property
-    @override
-    def motion_detection_enabled(self) -> bool:
-        """Return the camera motion detection status."""
-        if (status := self._read_wrapper(self._motion_detection_switch)) is not None:
-            return status
-        return False
+    # async def async_added_to_hass(self) -> None:
+    #     self.async_schedule_update_ha_state(True)
 
-    @override
-    async def stream_source(self) -> str | None:
-        """Return the source of the stream."""
-        return await self.hass.async_add_executor_job(
-            self.device_manager.get_device_stream_allocate,
-            self.device.id,
-            "rtsp",
+    def update(self) -> None:
+        """Update the image."""
+        raise NotImplementedError
+
+    async def async_update(self) -> None:
+        """Update the image."""
+
+        _LOGGER.debug("Updating image")
+
+        vacuum = await self.hass.async_add_executor_job(
+            tuya_vacuum.TuyaVacuum,
+            self._origin,
+            self._client_id,
+            self._client_secret,
+            self._device_id,
         )
 
-    @override
+        # Fetch the realtime map
+        vacuum_map = vacuum.fetch_realtime_map()
+
+        # Get the image
+        image = vacuum_map.to_image()
+
+        # Convert the image to bytes
+        img_byte_arr = io.BytesIO()
+        image.save(img_byte_arr, format="PNG")
+        self._image = img_byte_arr.getvalue()
+
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
-    ) -> bytes | None:
-        """Return a still image response from the camera."""
-        stream_source = await self.stream_source()
-        if not stream_source:
-            return None
-        return await ffmpeg.async_get_image(
-            self.hass,
-            stream_source,
-            width=width,
-            height=height,
-        )
+    ) -> Coroutine[Any, Any, bytes | None]:
+        """Return bytes of the image."""
+        return self._image
 
-    @override
-    async def async_enable_motion_detection(self) -> None:
-        """Enable motion detection in the camera."""
-        await self._async_send_wrapper_updates(self._motion_detection_switch, True)
-
-    @override
-    async def async_disable_motion_detection(self) -> None:
-        """Disable motion detection in camera."""
-        await self._async_send_wrapper_updates(self._motion_detection_switch, False)
+    @property
+    def should_poll(self) -> bool:
+        return True
